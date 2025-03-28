@@ -894,10 +894,14 @@ Official recommended values https://github.com/ali-vilab/TeaCache/tree/main/TeaC
         model_clone.model_options["transformer_options"]["rel_l1_thresh"] = rel_l1_thresh
         model_clone.model_options["transformer_options"]["teacache_device"] = teacache_device
         model_clone.model_options["transformer_options"]["coefficients"] = coefficients
-        diffusion_model = model_clone.get_model_object("diffusion_model")
-                
-        def outer_wrapper(start_percent, end_percent):        
+
+        # comment in for original behaviour
+        #  diffusion_model = model_clone.get_model_object("diffusion_model")
+
+        def outer_wrapper(start_percent, end_percent):
             def unet_wrapper_function(model_function, kwargs):
+                # (NEW) experimental, work with mult gpu units
+                diffusion_model = model_function.__self__.diffusion_model
                 input = kwargs["input"]
                 timestep = kwargs["timestep"]
                 c = kwargs["c"]
