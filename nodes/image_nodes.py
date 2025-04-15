@@ -787,7 +787,7 @@ and passes it through unchanged.
     
 class ImageBatchRepeatInterleaving:
     
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "MASK",)
     FUNCTION = "repeat"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """
@@ -802,13 +802,20 @@ with repeats 2 becomes batch of 10 images: 0, 0, 1, 1, 2, 2, 3, 3, 4, 4
             "required": {
                  "images": ("IMAGE",),
                  "repeats": ("INT", {"default": 1, "min": 1, "max": 4096}),
-        },
-    } 
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
     
-    def repeat(self, images, repeats):
+    def repeat(self, images, repeats, mask=None):
        
         repeated_images = torch.repeat_interleave(images, repeats=repeats, dim=0)
-        return (repeated_images, )
+        if mask is not None:
+            mask = torch.repeat_interleave(mask, repeats=repeats, dim=0)
+        else:
+            mask = torch.zeros_like(repeated_images[:, 0:1, :, :])
+        return (repeated_images, mask)
     
 class ImageUpscaleWithModelBatched:
     @classmethod
@@ -1835,6 +1842,8 @@ Inserts images at the specified indices into the original image batch.
         }
     
     def insertimagesfrombatch(self, original_images, images_to_insert, indexes):
+
+        input_images = original_images.clone()
         
         # Parse the indexes string into a list of integers
         index_list = [int(index.strip()) for index in indexes.split(',')]
@@ -1848,9 +1857,9 @@ Inserts images at the specified indices into the original image batch.
         
         # Insert the images at the specified indices
         for index, image in zip(indices_tensor, images_to_insert):
-            original_images[index] = image
+            input_images[index] = image
         
-        return (original_images,)
+        return (input_images,)
 
 class PadImageBatchInterleaved:
     
@@ -1911,7 +1920,7 @@ Inserts empty frames between the images in a batch.
 
 class ReplaceImagesInBatch:
     
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "MASK",)
     FUNCTION = "replace"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """
@@ -1927,20 +1936,38 @@ with the replacement images.
                  "replacement_images": ("IMAGE",),
                  "start_index": ("INT", {"default": 1,"min": 0, "max": 4096, "step": 1}),
         },
+        "optional": {
+            "original_masks": ("MASK",),
+            "replacement_masks": ("MASK",),
+        }
     } 
     
-    def replace(self, original_images, replacement_images, start_index):
+    def replace(self, original_images, replacement_images, start_index, original_masks=None, replacement_masks=None):
         images = None
         if start_index >= len(original_images):
             raise ValueError("GetImageRangeFromBatch: Start index is out of range")
         end_index = start_index + len(replacement_images)
         if end_index > len(original_images):
             raise ValueError("GetImageRangeFromBatch: End index is out of range")
-         # Create a copy of the original_images tensor
+        
+        if original_masks is not None and replacement_masks is not None:
+            original_masks_copy = original_masks.clone()
+            if original_masks_copy.shape[1] != replacement_masks.shape[1] or original_masks_copy.shape[2] != replacement_masks.shape[2]:
+                replacement_masks = common_upscale(replacement_masks.unsqueeze(1), original_masks_copy.shape[1], original_masks_copy.shape[2], "nearest-exact", "center").squeeze(0)
+                
+            original_masks_copy[start_index:end_index] = replacement_masks
+            masks = original_masks_copy
+        else:
+            masks = torch.zeros(1,64,64, device=original_images.device, dtype=original_images.dtype)
+        
         original_images_copy = original_images.clone()
+
+        if original_images_copy.shape[2] != replacement_images.shape[2] or original_images_copy.shape[3] != replacement_images.shape[3]:
+            replacement_images = common_upscale(replacement_images.movedim(-1, 1), original_images_copy.shape[1], original_images_copy.shape[2], "lanczos", "center").movedim(1, -1)
+        
         original_images_copy[start_index:end_index] = replacement_images
         images = original_images_copy
-        return (images, )
+        return (images, masks)
     
 
 class ReverseImageBatch:
@@ -3149,9 +3176,11 @@ class ImagePadKJ:
                     "extra_padding": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                     "pad_mode": (["edge", "color"],),
                     "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255, separated by commas."}),
-                  }
-                , "optional": {
+                  },
+                "optional": {
                     "mask": ("MASK", ),
+                    "target_width": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1, "forceInput": True}),
+                    "target_height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1, "forceInput": True}),
                 }
                 }
     
@@ -3161,7 +3190,7 @@ class ImagePadKJ:
     CATEGORY = "KJNodes/image"
     DESCRIPTION = "Pad the input image and optionally mask with the specified padding."
         
-    def pad(self, image, left, right, top, bottom, extra_padding, color, pad_mode, mask=None):
+    def pad(self, image, left, right, top, bottom, extra_padding, color, pad_mode, mask=None, target_width=None, target_height=None):
         B, H, W, C = image.shape
         
         # Resize masks to image dimensions if necessary
@@ -3175,15 +3204,27 @@ class ImagePadKJ:
         if len(bg_color) == 1:
             bg_color = bg_color * 3  # Grayscale to RGB
         bg_color = torch.tensor(bg_color, dtype=image.dtype, device=image.device)
-
+        
         # Calculate padding sizes with extra padding
-        pad_left = left + extra_padding
-        pad_right = right + extra_padding
-        pad_top = top + extra_padding
-        pad_bottom = bottom + extra_padding
+        if target_width is not None and target_height is not None:
+            if extra_padding > 0:
+                image = common_upscale(image.movedim(-1, 1), W - extra_padding, H - extra_padding, "lanczos", "disabled").movedim(1, -1)
+                B, H, W, C = image.shape
 
-        padded_width = W + pad_left + pad_right
-        padded_height = H + pad_top + pad_bottom
+            padded_width = target_width
+            padded_height = target_height
+            pad_left = (padded_width - W) // 2
+            pad_right = padded_width - W - pad_left
+            pad_top = (padded_height - H) // 2
+            pad_bottom = padded_height - H - pad_top
+        else:
+            pad_left = left + extra_padding
+            pad_right = right + extra_padding
+            pad_top = top + extra_padding
+            pad_bottom = bottom + extra_padding
+
+            padded_width = W + pad_left + pad_right
+            padded_height = H + pad_top + pad_bottom
         out_image = torch.zeros((B, padded_height, padded_width, C), dtype=image.dtype, device=image.device)
         
         # Fill padded areas
